@@ -4,7 +4,8 @@ import json
 import math
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
 from self_improve_step import self_improve
@@ -28,7 +29,7 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
     initial_folder_name = 'initial' if not polyglot else 'initial_polyglot'
     if not prevrun_dir and not os.path.exists(f"{output_dir}/{initial_folder_name}"):
         if os.path.exists(initial_folder_name):
-            os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
+            shutil.copytree(initial_folder_name, f"{output_dir}/initial")
         else:
             raise RuntimeError("Error: Need to properly configure evaluation results for the initial version.")
     
@@ -99,8 +100,8 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         probabilities = [prob / sum(probabilities) for prob in probabilities]
         parent_commits = random.choices(commits, probabilities, k=selfimprove_size)
     elif method == 'best':
-        # Choose parents with the best score
-        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'])
+        # Choose parents with the best score (descending sort)
+        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'], reverse=True)
         parent_commits = sorted_commits[:min(selfimprove_size, len(sorted_commits))]
         if len(parent_commits) < selfimprove_size:
             parent_commits.extend(random.choices(parent_commits, k=selfimprove_size - len(parent_commits)))
@@ -141,7 +142,7 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
                 continue
 
             # Choose a random unresolved entry
-            if unresolved_ids == 0:
+            if len(unresolved_ids) == 0:
                 continue
             entry_ids = unresolved_ids
         entry = random.choice(entry_ids)
@@ -225,7 +226,7 @@ def main():
     parser.add_argument("--selfimprove_workers", type=int, default=2, help="Number of parallel workers for self-improvement attempts.")
     parser.add_argument(
         "--choose_selfimproves_method", type=str, default='score_child_prop',
-        choices=['random', 'score_prop', 'score_child_prop' 'best'],
+        choices=['random', 'score_prop', 'score_child_prop', 'best'],
         help="Method to choose self-improve attempts.",
     )
     parser.add_argument("--continue_from", type=str, default=None, help="Directory to continue the run from.")

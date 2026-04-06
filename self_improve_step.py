@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import docker
 
 from llm import create_client, get_response_from_llm, extract_json_between_markers
@@ -431,7 +432,9 @@ def main():
     args = parser.parse_args()
 
     # Copy cached initial version into experiment dir
-    os.system(f"cp -r initial/ {args.output_dir}")
+    if os.path.exists(args.output_dir):
+        shutil.rmtree(args.output_dir)
+    shutil.copytree("initial", args.output_dir)
 
     metadata = self_improve(
         parent_commit=args.parent_commit,

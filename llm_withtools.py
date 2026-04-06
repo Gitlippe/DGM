@@ -49,20 +49,21 @@ def get_response_withtools(
                 tools=tools,
                 parallel_tool_calls=False
             )
-            response = response
         else:
             raise ValueError(f"Unsupported model: {model}")
         return response
     except Exception as e:
-        logging(f"Error in get_response_withtools: {str(e)}")
+        if logging:
+            logging(f"Error in get_response_withtools: {str(e)}")
+
+        # Context window limit is unrecoverable, raise immediately
+        if 'Input is too long for requested model' in str(e):
+            raise
+
         if max_retry > 0:
             return get_response_withtools(client, model, messages, tools, tool_choice, logging, max_retry - 1)
 
-        # Hitting the context window limit
-        if 'Input is too long for requested model' in str(e):
-            pass
-
-        raise  # Re-raise the exception after logging
+        raise
 
 def check_for_tool_use(response, model=''):
     """
@@ -80,8 +81,10 @@ def check_for_tool_use(response, model=''):
 
     elif model.startswith('o3-'):
         # OpenAI, check for tool_calls in response
-        for tool_call in response.output:
-            if tool_call.type == "function_call":
+        tool_call = None
+        for item in response.output:
+            if item.type == "function_call":
+                tool_call = item
                 break
 
         if tool_call:
@@ -330,8 +333,9 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
             # Check for next tool use
             tool_use = check_for_tool_use(response, model=client_model)
 
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        logging(f"Error in chat_with_agent_manualtools: {e}\n{traceback.format_exc()}")
 
     return new_msg_history
 
@@ -419,8 +423,9 @@ def chat_with_agent_claude(
             ],
         })
 
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        logging(f"Error in chat_with_agent_claude: {e}\n{traceback.format_exc()}")
 
     return new_msg_history
 
@@ -506,8 +511,9 @@ def chat_with_agent_openai(
         # Get final response
         new_msg_history.append(response)
 
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        logging(f"Error in chat_with_agent_openai: {e}\n{traceback.format_exc()}")
 
     return new_msg_history
 
