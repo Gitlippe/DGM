@@ -7,6 +7,9 @@ import random
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
+import time
+
+from llm import get_llm_metrics, reset_llm_metrics
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
 from self_improve_step import self_improve
 from utils.common_utils import load_json_file
@@ -269,6 +272,9 @@ def main():
     test_more_threshold = 0.4
     # Run the DGM
     for gen_num in range(start_gen_num, args.max_generation):
+        gen_start_time = time.time()
+        reset_llm_metrics()
+
         # Choose self-improve attempts
         selfimprove_entries = choose_selfimproves(
             output_dir, archive, args.selfimprove_size,
@@ -322,6 +328,17 @@ def main():
         )
         archive = update_archive(output_dir, archive, selfimprove_ids_compiled, method=args.update_archive, noise_leeway=args.eval_noise)
 
+        # Gather generation-level metrics
+        gen_duration = time.time() - gen_start_time
+        llm_metrics = get_llm_metrics()
+        archive_scores = []
+        for aid in archive:
+            try:
+                meta = load_json_file(os.path.join(output_dir, aid, "metadata.json"))
+                archive_scores.append(meta["overall_performance"]["accuracy_score"])
+            except Exception:
+                pass
+
         # Save DGM state
         with open(os.path.join(output_dir, "dgm_metadata.jsonl"), "a") as f:
             f.write(json.dumps({
@@ -330,7 +347,22 @@ def main():
                 "children": selfimprove_ids,
                 "children_compiled": selfimprove_ids_compiled,
                 "archive": archive,
+                "metrics": {
+                    "generation_duration_seconds": round(gen_duration, 1),
+                    "archive_size": len(archive),
+                    "archive_best_score": max(archive_scores) if archive_scores else None,
+                    "archive_mean_score": round(sum(archive_scores) / len(archive_scores), 4) if archive_scores else None,
+                    "compile_rate": round(len(selfimprove_ids_compiled) / max(len(selfimprove_ids), 1), 4),
+                    "llm_calls": llm_metrics["total_calls"],
+                    "llm_total_tokens": llm_metrics["total_input_tokens"] + llm_metrics["total_output_tokens"],
+                    "llm_latency_seconds": round(llm_metrics["total_latency_seconds"], 1),
+                },
             }, indent=2) + "\n")
+
+        logger.info(f"Generation {gen_num} completed in {gen_duration:.1f}s | "
+                     f"archive_size={len(archive)} best={max(archive_scores) if archive_scores else 'N/A'} "
+                     f"compiled={len(selfimprove_ids_compiled)}/{len(selfimprove_ids)} "
+                     f"llm_calls={llm_metrics['total_calls']}")
 
 if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import shutil
+import time
 import docker
 
 from llm import create_client, get_response_from_llm, extract_json_between_markers
@@ -341,6 +342,7 @@ def self_improve(
 
     # Run self-improvement
     safe_log("Running self-improvement")
+    improvement_start = time.time()
     chat_history_file_container = "/dgm/self_evo.md"
     test_description = get_test_description(swerepo=False)
     env_vars = {
@@ -364,6 +366,10 @@ def self_improve(
     ]
     exec_result = container.exec_run(cmd, environment=env_vars, workdir='/')
     log_container_output(exec_result)
+
+    improvement_duration = time.time() - improvement_start
+    metadata['improvement_duration_seconds'] = round(improvement_duration, 1)
+    safe_log(f"Self-improvement completed in {improvement_duration:.1f}s")
 
     # Copy output files back to host
     chat_history_file = os.path.join(output_dir, "self_evo.md")
