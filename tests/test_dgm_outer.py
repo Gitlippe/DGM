@@ -1,6 +1,7 @@
+import importlib
 import json
-
-from DGM_outer import choose_selfimproves, initialize_run
+import sys
+from types import SimpleNamespace
 
 
 def write_metadata(base_dir, commit_id, overall_performance, parent_commit="initial"):
@@ -13,7 +14,14 @@ def write_metadata(base_dir, commit_id, overall_performance, parent_commit="init
     (commit_dir / "metadata.json").write_text(json.dumps(metadata))
 
 
+def load_dgm_outer(monkeypatch):
+    sys.modules.pop("DGM_outer", None)
+    monkeypatch.setitem(sys.modules, "self_improve_step", SimpleNamespace(self_improve=lambda **_: None))
+    return importlib.import_module("DGM_outer")
+
+
 def test_choose_selfimproves_best_prefers_highest_score(tmp_path, monkeypatch):
+    dgm_outer = load_dgm_outer(monkeypatch)
     output_dir = tmp_path / "output"
     write_metadata(
         output_dir,
@@ -47,7 +55,7 @@ def test_choose_selfimproves_best_prefers_highest_score(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("random.choice", lambda items: items[0])
 
-    chosen = choose_selfimproves(
+    chosen = dgm_outer.choose_selfimproves(
         str(output_dir),
         ["initial", "candidate_low", "candidate_high"],
         selfimprove_size=1,
@@ -59,6 +67,7 @@ def test_choose_selfimproves_best_prefers_highest_score(tmp_path, monkeypatch):
 
 
 def test_choose_selfimproves_skips_empty_unresolved_ids(tmp_path, monkeypatch):
+    dgm_outer = load_dgm_outer(monkeypatch)
     output_dir = tmp_path / "output"
     write_metadata(
         output_dir,
@@ -72,7 +81,7 @@ def test_choose_selfimproves_skips_empty_unresolved_ids(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("random.random", lambda: 1.0)
 
-    chosen = choose_selfimproves(
+    chosen = dgm_outer.choose_selfimproves(
         str(output_dir),
         ["initial"],
         selfimprove_size=1,
@@ -84,13 +93,14 @@ def test_choose_selfimproves_skips_empty_unresolved_ids(tmp_path, monkeypatch):
 
 
 def test_initialize_run_polyglot_copies_seed_data_to_initial(tmp_path, monkeypatch):
+    dgm_outer = load_dgm_outer(monkeypatch)
     monkeypatch.chdir(tmp_path)
     source_dir = tmp_path / "initial_polyglot"
     source_dir.mkdir()
     (source_dir / "metadata.json").write_text("{}")
 
     output_dir = tmp_path / "output"
-    archive, start_generation = initialize_run(str(output_dir), polyglot=True)
+    archive, start_generation = dgm_outer.initialize_run(str(output_dir), polyglot=True)
 
     assert archive == ["initial"]
     assert start_generation == 0
