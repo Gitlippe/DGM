@@ -26,6 +26,7 @@ from utils.docker_utils import (
 )
 
 dataset = None
+_dataset_cache = {}
 diagnose_model = 'o1-2024-12-17'
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
@@ -239,13 +240,18 @@ def self_improve(
 ):  
 
     global dataset
-    if polyglot:
+    cache_key = 'polyglot' if polyglot else 'swe'
+    if cache_key in _dataset_cache:
+        dataset = _dataset_cache[cache_key]
+    elif polyglot:
         with open("polyglot/polyglot_benchmark_metadata.json") as f:
             dataset = json.loads(f.read())
+        _dataset_cache[cache_key] = dataset
     else:
         from datasets import load_dataset
         dataset = load_dataset("princeton-nlp/SWE-bench_Verified")
         dataset = dataset['test']
+        _dataset_cache[cache_key] = dataset
 
     # Variables for this self-improvement attempt
     metadata = {}

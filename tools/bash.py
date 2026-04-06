@@ -105,6 +105,15 @@ class BashSession:
             self._timed_out = True
             raise ValueError(str(e))
 
+MAX_OUTPUT_CHARS = 40000
+
+def maybe_truncate(content: str, max_length: int = MAX_OUTPUT_CHARS) -> str:
+    """Truncate long output, keeping head and tail for context."""
+    if len(content) > max_length:
+        half = max_length // 2
+        return content[:half] + f"\n\n... ({len(content) - max_length} characters truncated) ...\n\n" + content[-half:]
+    return content
+
 def filter_error(error):
     # Filter out errors that we do not want to see
     filtered_lines = []
@@ -128,27 +137,49 @@ def filter_error(error):
         i += 1
     return '\n'.join(filtered_lines).strip()
 
+_session_instance = None
+_session_lock = None
+
+def _get_or_create_lock():
+    global _session_lock
+    if _session_lock is None:
+        import threading
+        _session_lock = threading.Lock()
+    return _session_lock
+
 async def tool_function_call(command):
-    """Execute a command in the bash shell."""
+    """Execute a command in the bash shell, reusing a persistent session."""
+    global _session_instance
     try:
-        bash_session = BashSession()
+        if _session_instance is None or _session_instance._timed_out or (
+            _session_instance._process is not None and _session_instance._process.returncode is not None
+        ):
+            if _session_instance is not None:
+                _session_instance.stop()
+            _session_instance = BashSession()
 
-        if not bash_session._started:
-            await bash_session.start()
+        if not _session_instance._started:
+            await _session_instance.start()
 
-        output, error = await bash_session.run(command)
+        output, error = await _session_instance.run(command)
         error = filter_error(error)
         result = ""
         if output:
             result += output
         if error:
             result += "\nError:\n" + error
-        return result.strip()
+        return maybe_truncate(result.strip())
     except Exception as e:
+        # Reset session on failure so next call gets a fresh one
+        if _session_instance is not None:
+            _session_instance.stop()
+            _session_instance = None
         return f"Error: {str(e)}"
 
 def tool_function(command):
-    return asyncio.run(tool_function_call(command))
+    lock = _get_or_create_lock()
+    with lock:
+        return asyncio.run(tool_function_call(command))
 
 if __name__ == "__main__":
     # Example usage

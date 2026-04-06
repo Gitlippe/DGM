@@ -32,10 +32,13 @@ def tool_info():
         }
     }
 
-def maybe_truncate(content: str, max_length: int = 10000) -> str:
+MAX_OUTPUT_CHARS = 40000
+
+def maybe_truncate(content: str, max_length: int = MAX_OUTPUT_CHARS) -> str:
     """Truncate long content and add marker."""
     if len(content) > max_length:
-        return content[:max_length] + "\n<response clipped>"
+        half = max_length // 2
+        return content[:half] + f"\n\n... ({len(content) - max_length} characters truncated) ...\n\n" + content[-half:]
     return content
 
 def validate_path(path: str, command: str) -> Path:
