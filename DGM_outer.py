@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import shutil
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
 
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
@@ -26,9 +27,10 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
 
     # Copy cached initial version into experiment dir
     initial_folder_name = 'initial' if not polyglot else 'initial_polyglot'
-    if not prevrun_dir and not os.path.exists(f"{output_dir}/{initial_folder_name}"):
+    target_initial_dir = os.path.join(output_dir, "initial")
+    if not prevrun_dir and not os.path.exists(target_initial_dir):
         if os.path.exists(initial_folder_name):
-            os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
+            shutil.copytree(initial_folder_name, target_initial_dir)
         else:
             raise RuntimeError("Error: Need to properly configure evaluation results for the initial version.")
     
@@ -75,6 +77,9 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
             print(f"{commit} not eligible for being a parent: {e}")
             continue
 
+    if not candidates:
+        return []
+
     # Choose parents based on method and baseline
     if run_baseline == 'no_darwin':
         # Always take the last commit
@@ -100,7 +105,7 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         parent_commits = random.choices(commits, probabilities, k=selfimprove_size)
     elif method == 'best':
         # Choose parents with the best score
-        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'])
+        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'], reverse=True)
         parent_commits = sorted_commits[:min(selfimprove_size, len(sorted_commits))]
         if len(parent_commits) < selfimprove_size:
             parent_commits.extend(random.choices(parent_commits, k=selfimprove_size - len(parent_commits)))
@@ -141,7 +146,7 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
                 continue
 
             # Choose a random unresolved entry
-            if unresolved_ids == 0:
+            if not unresolved_ids:
                 continue
             entry_ids = unresolved_ids
         entry = random.choice(entry_ids)
@@ -225,7 +230,7 @@ def main():
     parser.add_argument("--selfimprove_workers", type=int, default=2, help="Number of parallel workers for self-improvement attempts.")
     parser.add_argument(
         "--choose_selfimproves_method", type=str, default='score_child_prop',
-        choices=['random', 'score_prop', 'score_child_prop' 'best'],
+        choices=['random', 'score_prop', 'score_child_prop', 'best'],
         help="Method to choose self-improve attempts.",
     )
     parser.add_argument("--continue_from", type=str, default=None, help="Directory to continue the run from.")
@@ -237,6 +242,7 @@ def main():
     parser.add_argument("--polyglot", default=False, action='store_true', help="Run single shallow evaluation for self-improvement on swe.")
     parser.add_argument("--eval_noise", type=float, default=0.1, help="Noise leeway for evaluation.")
     parser.add_argument("--no_full_eval", default=False, action='store_true', help="Do not run full evaluation on swe if a node is the top N highest performing.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible parent and entry selection.")
     # baselines
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'], help="Baseline to run.")
     args = parser.parse_args()
@@ -263,8 +269,11 @@ def main():
 
     # Set up logger
     logger = setup_logger(os.path.join(output_dir, "dgm_outer.log"))
+    if args.seed is not None:
+        random.seed(args.seed)
     logger.info(f"Starting DGM run {run_id} with arguments: {vars(args)}")
     logger.info(f"Archive: {archive}")
+    logger.info(f"Random seed: {args.seed}")
     test_more_threshold = 0.4
     # Run the DGM
     for gen_num in range(start_gen_num, args.max_generation):
@@ -279,8 +288,10 @@ def main():
 
         # Run self-improvement processes
         selfimprove_ids = []
+        failed_attempts = []
+        full_eval_threshold = None if args.no_full_eval else get_full_eval_threshold(output_dir, archive)
         with ThreadPoolExecutor(max_workers=args.selfimprove_workers) as executor:
-            futures = [
+            future_to_attempt = {
                 executor.submit(
                     self_improve,
                     parent_commit=parent_commit,
@@ -293,24 +304,33 @@ def main():
                     test_more_threshold=None if args.shallow_eval else test_more_threshold,
                     test_task_list_more=None if args.shallow_eval else swe_issues_med,
                     polyglot=args.polyglot,
-                    full_eval_threshold=None if args.no_full_eval else get_full_eval_threshold(output_dir, archive),
+                    full_eval_threshold=full_eval_threshold,
                     run_baseline=args.run_baseline,
-                )
+                    dgm_run_id=run_id,
+                    generation=gen_num,
+                ): {"parent_commit": parent_commit, "entry": entry}
                 for parent_commit, entry in selfimprove_entries
-            ]
+            }
 
-            for future in as_completed(futures):
+            for future in as_completed(future_to_attempt):
+                attempt = future_to_attempt[future]
                 try:
                     # Added timeout to avoid hanging indefinitely (1.5 h here)
                     metadata = future.result(timeout=1.5*60*60)
                     selfimprove_ids.append(metadata['run_id'])
                 except TimeoutError:
-                    logger.error("Self-improvement attempt timed out.")
+                    logger.error(f"Self-improvement attempt timed out: {attempt}")
                     future.cancel()  # Optionally cancel the future if it's still running
+                    failed_attempts.append({**attempt, "error_type": "timeout"})
                 except Exception as e:
                     import traceback
-                    logger.error(f"Self-improvement step failed: {e}")
+                    logger.error(f"Self-improvement step failed for {attempt}: {e}")
                     logger.error(f"Traceback:\n{traceback.format_exc()}")
+                    failed_attempts.append({
+                        **attempt,
+                        "error_type": "exception",
+                        "error": str(e),
+                    })
 
         # Update archive
         logger.info(f"Updating archive for generation {gen_num}")
@@ -325,9 +345,12 @@ def main():
         with open(os.path.join(output_dir, "dgm_metadata.jsonl"), "a") as f:
             f.write(json.dumps({
                 "generation": gen_num,
+                "seed": args.seed,
                 "selfimprove_entries": selfimprove_entries,
                 "children": selfimprove_ids,
                 "children_compiled": selfimprove_ids_compiled,
+                "children_failed": failed_attempts,
+                "full_eval_threshold": full_eval_threshold,
                 "archive": archive,
             }, indent=2) + "\n")
 

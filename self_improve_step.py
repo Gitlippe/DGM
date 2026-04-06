@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import traceback
 import docker
 
 from llm import create_client, get_response_from_llm, extract_json_between_markers
@@ -26,6 +27,27 @@ from utils.docker_utils import (
 
 dataset = None
 diagnose_model = 'o1-2024-12-17'
+
+def _utcnow():
+    return datetime.datetime.utcnow().isoformat(timespec='seconds') + "Z"
+
+def _start_phase(metadata, phase_name):
+    metadata['current_phase'] = phase_name
+    metadata.setdefault('phase_timings', {})[phase_name] = {
+        "started_at": _utcnow(),
+    }
+
+def _finish_phase(metadata, phase_name):
+    phase_metadata = metadata.setdefault('phase_timings', {}).setdefault(phase_name, {})
+    phase_metadata["finished_at"] = _utcnow()
+
+def _record_error(metadata, phase_name, error):
+    metadata.setdefault('errors', []).append({
+        "phase": phase_name,
+        "error": str(error),
+        "traceback": traceback.format_exc(),
+        "recorded_at": _utcnow(),
+    })
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)
@@ -122,7 +144,20 @@ def save_metadata(metadata, output_dir):
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=4)
 
-def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more):
+def run_harness_swe(
+    entry,
+    model_name_or_path,
+    patch_files,
+    num_evals,
+    output_dir,
+    metadata,
+    run_id,
+    test_more_threshold,
+    test_task_list,
+    test_task_list_more,
+    full_eval_threshold=None,
+    test_task_list_big=None,
+):
     safe_log('Start harness')
     test_task_list = [entry] if test_task_list is None else test_task_list
     dnames = harness(
@@ -176,6 +211,37 @@ def run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_di
         performances, overall_performance = get_all_performance(model_name_or_path, results_dir=output_dir)
         metadata['overall_performance'] = overall_performance
         safe_log("End of evaluation more")
+
+    if (
+        overall_performance and
+        full_eval_threshold is not None and
+        test_task_list_big is not None and
+        overall_performance.get('accuracy_score', 0) >= full_eval_threshold
+    ):
+        safe_log("Start full evaluation cycle")
+        dnames = harness(
+            test_task_list=test_task_list_big,
+            num_samples=-1,
+            max_workers=min(5, len(test_task_list_big)),
+            model_name_or_path=model_name_or_path,
+            model_patch_paths=patch_files,
+            num_evals=num_evals,
+            num_evals_parallel=5,
+            pred_dname=os.path.join(output_dir, "predictions"),
+        )
+        safe_log('Start make_report full')
+        make_report(
+            dnames,
+            run_ids=[f"{run_id}_{i}" for i in range(len(dnames))],
+            dataset_name="princeton-nlp/SWE-bench_Verified",
+            output_dir=output_dir,
+            dnames_workers=5,
+        )
+        safe_log('Start get_performance full')
+        performances, overall_performance = get_all_performance(model_name_or_path, results_dir=output_dir)
+        metadata['overall_performance'] = overall_performance
+        metadata['full_evaluation_ran'] = True
+        safe_log("End of evaluation full")
 
 def run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more):
     safe_log('Start harness')
@@ -234,7 +300,9 @@ def self_improve(
     full_eval_threshold=None,
     # Run baseline
     run_baseline=None,
-    polyglot=False
+    polyglot=False,
+    dgm_run_id=None,
+    generation=None,
 ):  
 
     global dataset
@@ -253,14 +321,31 @@ def self_improve(
     out_dir_base = output_dir  # out_dir_base should be /dgm/output_selfimprove/ or /dgm/output_dgm/{dgm_run_id}/
     output_dir = os.path.join(root_dir, f"{output_dir}/{run_id}/")
     os.makedirs(output_dir, exist_ok=True)
-    metadata['run_id'] = run_id
-    metadata['parent_commit'] = parent_commit
+    metadata.update({
+        'run_id': run_id,
+        'dgm_run_id': dgm_run_id,
+        'generation': generation,
+        'parent_commit': parent_commit,
+        'entry': entry,
+        'status': 'running',
+        'started_at': _utcnow(),
+        'errors': [],
+        'phase_timings': {},
+        'full_eval_threshold': full_eval_threshold,
+    })
     test_task_list_big = load_json_file("./swe_bench/subsets/big.json")
+
+    def finalize(status):
+        metadata['status'] = status
+        metadata['finished_at'] = _utcnow()
+        save_metadata(metadata, output_dir)
+        return metadata
 
     # Set up logger
     logger = setup_logger(os.path.join(output_dir, "self_improve.log"))
 
     # Create and start the Docker container
+    _start_phase(metadata, "docker_setup")
     image_name = "dgm"
     container_name = f"dgm-container-{run_id}"
     client = docker.from_env()
@@ -271,7 +356,11 @@ def self_improve(
         client, root_dir, image_name, container_name,
         force_rebuild=force_rebuild,
     )
-    container.start()
+    if container is None:
+        _record_error(metadata, "docker_setup", "Failed to build or start the DGM container")
+        _finish_phase(metadata, "docker_setup")
+        return finalize("docker_setup_failed")
+    _finish_phase(metadata, "docker_setup")
 
     if polyglot:
         # remove the swe version of coding_agent.py
@@ -315,25 +404,26 @@ def self_improve(
     # Get tasks to improve
     if entry:
         safe_log(f"Task to improve: {entry}")
+        _start_phase(metadata, "diagnose_problem")
         problem_statement = diagnose_problem(entry, parent_commit, root_dir, out_dir_base, patch_files=patch_files, polyglot=polyglot)
+        _finish_phase(metadata, "diagnose_problem")
         safe_log(f"problem_statement: {problem_statement}")
     else:
         safe_log("No entry provided. Exiting.")
         cleanup_container(container)
-        save_metadata(metadata, output_dir)
-        return metadata
+        return finalize("no_entry")
 
-    metadata['entry'] = entry
     metadata['problem_statement'] = problem_statement
     # If problem statement is not found, exit
     if not problem_statement:
         safe_log("Failed to diagnose the problem statement. Exiting.")
+        _record_error(metadata, "diagnose_problem", "Failed to diagnose the problem statement")
         cleanup_container(container)
-        save_metadata(metadata, output_dir)
-        return metadata
+        return finalize("diagnosis_failed")
 
     # Run self-improvement
     safe_log("Running self-improvement")
+    _start_phase(metadata, "agent_run")
     chat_history_file_container = "/dgm/self_evo.md"
     test_description = get_test_description(swerepo=False)
     env_vars = {
@@ -357,12 +447,15 @@ def self_improve(
     ]
     exec_result = container.exec_run(cmd, environment=env_vars, workdir='/')
     log_container_output(exec_result)
+    _finish_phase(metadata, "agent_run")
 
     # Copy output files back to host
+    _start_phase(metadata, "extract_artifacts")
     chat_history_file = os.path.join(output_dir, "self_evo.md")
     copy_from_container(container, chat_history_file_container, chat_history_file)
     model_patch_file = os.path.join(output_dir, "model_patch.diff")
     copy_from_container(container, "/dgm/model_patch.diff", model_patch_file)
+    _finish_phase(metadata, "extract_artifacts")
 
     # Try reading the patch file to validate it
     try:
@@ -375,8 +468,9 @@ def self_improve(
                 raise Exception("Model patch file is empty")
     except Exception as e:
         safe_log(f"Failed to read model patch file: {str(e)}")
-        save_metadata(metadata, output_dir)
-        return metadata
+        _record_error(metadata, "extract_artifacts", e)
+        cleanup_container(container)
+        return finalize("patch_extraction_failed")
 
     patch_files.append(model_patch_file)
 
@@ -391,16 +485,35 @@ def self_improve(
     model_name_or_path = run_id
     if model_patch_exists and model_patch_notempty:
         try:
+            _start_phase(metadata, "evaluation")
             if not polyglot:
-                run_harness_swe(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
+                run_harness_swe(
+                    entry,
+                    model_name_or_path,
+                    patch_files,
+                    num_evals,
+                    output_dir,
+                    metadata,
+                    run_id,
+                    test_more_threshold,
+                    test_task_list,
+                    test_task_list_more,
+                    full_eval_threshold=full_eval_threshold,
+                    test_task_list_big=test_task_list_big,
+                )
             else:
                 run_harness_polyglot(entry, model_name_or_path, patch_files, num_evals, output_dir, metadata, run_id, test_more_threshold, test_task_list, test_task_list_more)
+            _finish_phase(metadata, "evaluation")
         except Exception as e:
             safe_log(f"Error while evaluating the self-improvement: {e}")
+            _record_error(metadata, "evaluation", e)
+            _finish_phase(metadata, "evaluation")
+            metadata['evaluation_error'] = str(e)
 
     # Post-self-improvement diagnosis
     if post_improve_diagnose:
         safe_log("Diagnosing the self-improvement")
+        _start_phase(metadata, "post_improve_diagnose")
         metadata['is_compiled'] = is_compiled_self_improve(metadata)
         if metadata['is_compiled']:
             safe_log("The self-improvement succeed to be complied")
@@ -414,10 +527,14 @@ def self_improve(
         else:
             safe_log("The self-improvement fail to be complied")
             metadata['improvement_diagnosis'] = "Fail to complied. Ignore this."
+        _finish_phase(metadata, "post_improve_diagnose")
 
     # Save metadata of this self-improvement attempt
-    save_metadata(metadata, output_dir)
-    return metadata
+    if metadata.get('evaluation_error'):
+        return finalize("evaluation_failed")
+    if not model_patch_exists or not model_patch_notempty:
+        return finalize("empty_model_patch")
+    return finalize("completed")
 
 def main():
     parser = argparse.ArgumentParser(description="Self-improvement step for the repository.")
