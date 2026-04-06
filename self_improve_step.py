@@ -6,6 +6,7 @@ import shutil
 import time
 import docker
 
+from config import DIAGNOSE_MODEL, SELF_IMPROVE_TIMEOUT
 from llm import create_client, get_response_from_llm, extract_json_between_markers
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
@@ -28,7 +29,7 @@ from utils.docker_utils import (
 
 dataset = None
 _dataset_cache = {}
-diagnose_model = 'o1-2024-12-17'
+diagnose_model = DIAGNOSE_MODEL
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)
@@ -354,7 +355,7 @@ def self_improve(
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
     }
     cmd = [
-        "timeout", "1800",  # 30min timeout
+        "timeout", str(SELF_IMPROVE_TIMEOUT),
         "python", "/dgm/coding_agent.py",
         "--problem_statement", problem_statement,
         "--git_dir", "/dgm/",

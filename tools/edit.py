@@ -1,5 +1,10 @@
 from pathlib import Path
+import os
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import TOOL_OUTPUT_MAX_CHARS
 
 def tool_info():
     return {
@@ -32,9 +37,7 @@ def tool_info():
         }
     }
 
-MAX_OUTPUT_CHARS = 40000
-
-def maybe_truncate(content: str, max_length: int = MAX_OUTPUT_CHARS) -> str:
+def maybe_truncate(content: str, max_length: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     """Truncate long content and add marker."""
     if len(content) > max_length:
         half = max_length // 2

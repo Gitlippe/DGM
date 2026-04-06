@@ -9,7 +9,7 @@ import anthropic
 import backoff
 import openai
 
-MAX_OUTPUT_TOKENS = 4096
+from config import MAX_OUTPUT_TOKENS
 
 # Thread-safe LLM call metrics tracking
 _metrics_lock = threading.Lock()

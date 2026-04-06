@@ -1,5 +1,9 @@
 import asyncio
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import TOOL_OUTPUT_MAX_CHARS, BASH_TOOL_TIMEOUT
 
 def tool_info():
     return {
@@ -30,7 +34,7 @@ class BashSession:
         self._started = False
         self._process = None
         self._timed_out = False
-        self._timeout = 120.0  # seconds
+        self._timeout = BASH_TOOL_TIMEOUT
         self._sentinel = "<<exit>>"
         self._output_delay = 0.2  # seconds
 
@@ -105,9 +109,7 @@ class BashSession:
             self._timed_out = True
             raise ValueError(str(e))
 
-MAX_OUTPUT_CHARS = 40000
-
-def maybe_truncate(content: str, max_length: int = MAX_OUTPUT_CHARS) -> str:
+def maybe_truncate(content: str, max_length: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     """Truncate long output, keeping head and tail for context."""
     if len(content) > max_length:
         half = max_length // 2

@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import time
 
+from config import CONVERGENCE_WINDOW, CONVERGENCE_THRESHOLD, MIN_ARCHIVE_SCORE, RANDOM_SEED
 from llm import get_llm_metrics, reset_llm_metrics
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
 from self_improve_step import self_improve
@@ -217,8 +218,7 @@ def get_full_eval_threshold(output_dir, archive):
 
     # Get threshold, second highest score
     threshold = sorted(archive_scores, reverse=True)[1] if len(archive_scores) > 1 else archive_scores[0]
-    # Ensure threshold is at least 0.4
-    threshold = max(threshold, 0.4)
+    threshold = max(threshold, MIN_ARCHIVE_SCORE)
 
     return threshold
 
@@ -243,7 +243,15 @@ def main():
     parser.add_argument("--no_full_eval", default=False, action='store_true', help="Do not run full evaluation on swe if a node is the top N highest performing.")
     # baselines
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'], help="Baseline to run.")
+    parser.add_argument("--random_seed", type=int, default=None, help="Random seed for reproducibility.")
+    parser.add_argument("--convergence_window", type=int, default=CONVERGENCE_WINDOW, help="Number of generations to look back for convergence detection.")
+    parser.add_argument("--convergence_threshold", type=float, default=CONVERGENCE_THRESHOLD, help="Min improvement over convergence window to continue.")
     args = parser.parse_args()
+
+    # Set random seed for reproducibility if configured
+    seed = RANDOM_SEED if RANDOM_SEED is not None else args.random_seed
+    if seed is not None:
+        random.seed(seed)
 
     # Variables for this DGM run
     if not args.continue_from:
@@ -363,6 +371,26 @@ def main():
                      f"archive_size={len(archive)} best={max(archive_scores) if archive_scores else 'N/A'} "
                      f"compiled={len(selfimprove_ids_compiled)}/{len(selfimprove_ids)} "
                      f"llm_calls={llm_metrics['total_calls']}")
+
+        # Convergence detection: check if the best score hasn't improved over the window
+        if (gen_num - start_gen_num) >= args.convergence_window:
+            try:
+                metadata_path = os.path.join(output_dir, "dgm_metadata.jsonl")
+                all_meta = load_dgm_metadata(metadata_path)
+                recent = all_meta[-args.convergence_window:]
+                recent_bests = [m.get("metrics", {}).get("archive_best_score") for m in recent
+                                if m.get("metrics", {}).get("archive_best_score") is not None]
+                if len(recent_bests) >= args.convergence_window:
+                    improvement = max(recent_bests) - min(recent_bests)
+                    if improvement < args.convergence_threshold:
+                        logger.info(
+                            f"Convergence detected: best score improved by only {improvement:.4f} "
+                            f"over the last {args.convergence_window} generations (threshold={args.convergence_threshold}). "
+                            f"Stopping evolution."
+                        )
+                        break
+            except Exception as e:
+                logger.warning(f"Convergence check failed: {e}")
 
 if __name__ == "__main__":
     main()
