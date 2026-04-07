@@ -2,8 +2,11 @@ import argparse
 import datetime
 import json
 import os
+import shutil
+import time
 import docker
 
+from config import DIAGNOSE_MODEL, SELF_IMPROVE_TIMEOUT
 from llm import create_client, get_response_from_llm, extract_json_between_markers
 from prompts.self_improvement_prompt import get_diagnose_prompt_polyglot, get_diagnose_prompt_swe, get_problem_description_prompt
 from prompts.diagnose_improvement_prompt import get_diagnose_improvement_prompt
@@ -25,7 +28,8 @@ from utils.docker_utils import (
 )
 
 dataset = None
-diagnose_model = 'o1-2024-12-17'
+_dataset_cache = {}
+diagnose_model = DIAGNOSE_MODEL
 
 def diagnose_problem(entry, commit, root_dir, out_dir, patch_files=[], max_attempts=3, polyglot=False):
     client = create_client(diagnose_model)
@@ -238,13 +242,18 @@ def self_improve(
 ):  
 
     global dataset
-    if polyglot:
+    cache_key = 'polyglot' if polyglot else 'swe'
+    if cache_key in _dataset_cache:
+        dataset = _dataset_cache[cache_key]
+    elif polyglot:
         with open("polyglot/polyglot_benchmark_metadata.json") as f:
             dataset = json.loads(f.read())
+        _dataset_cache[cache_key] = dataset
     else:
         from datasets import load_dataset
         dataset = load_dataset("princeton-nlp/SWE-bench_Verified")
         dataset = dataset['test']
+        _dataset_cache[cache_key] = dataset
 
     # Variables for this self-improvement attempt
     metadata = {}
@@ -334,6 +343,7 @@ def self_improve(
 
     # Run self-improvement
     safe_log("Running self-improvement")
+    improvement_start = time.time()
     chat_history_file_container = "/dgm/self_evo.md"
     test_description = get_test_description(swerepo=False)
     env_vars = {
@@ -345,7 +355,7 @@ def self_improve(
         "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
     }
     cmd = [
-        "timeout", "1800",  # 30min timeout
+        "timeout", str(SELF_IMPROVE_TIMEOUT),
         "python", "/dgm/coding_agent.py",
         "--problem_statement", problem_statement,
         "--git_dir", "/dgm/",
@@ -357,6 +367,10 @@ def self_improve(
     ]
     exec_result = container.exec_run(cmd, environment=env_vars, workdir='/')
     log_container_output(exec_result)
+
+    improvement_duration = time.time() - improvement_start
+    metadata['improvement_duration_seconds'] = round(improvement_duration, 1)
+    safe_log(f"Self-improvement completed in {improvement_duration:.1f}s")
 
     # Copy output files back to host
     chat_history_file = os.path.join(output_dir, "self_evo.md")
@@ -431,7 +445,9 @@ def main():
     args = parser.parse_args()
 
     # Copy cached initial version into experiment dir
-    os.system(f"cp -r initial/ {args.output_dir}")
+    if os.path.exists(args.output_dir):
+        shutil.rmtree(args.output_dir)
+    shutil.copytree("initial", args.output_dir)
 
     metadata = self_improve(
         parent_commit=args.parent_commit,

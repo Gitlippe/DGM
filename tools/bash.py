@@ -1,5 +1,11 @@
 import asyncio
+import concurrent.futures
 import os
+import sys
+import threading
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from config import TOOL_OUTPUT_MAX_CHARS, BASH_TOOL_TIMEOUT
 
 def tool_info():
     return {
@@ -30,7 +36,7 @@ class BashSession:
         self._started = False
         self._process = None
         self._timed_out = False
-        self._timeout = 120.0  # seconds
+        self._timeout = BASH_TOOL_TIMEOUT
         self._sentinel = "<<exit>>"
         self._output_delay = 0.2  # seconds
 
@@ -43,14 +49,14 @@ class BashSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy()  # Ensures inheritance of the current environment
+            env=os.environ.copy()
         )
         self._started = True
 
     def stop(self):
         if not self._started:
             return
-        if self._process.returncode is None:
+        if self._process and self._process.returncode is None:
             self._process.terminate()
         self._process = None
         self._started = False
@@ -105,18 +111,24 @@ class BashSession:
             self._timed_out = True
             raise ValueError(str(e))
 
+
+def maybe_truncate(content: str, max_length: int = TOOL_OUTPUT_MAX_CHARS) -> str:
+    """Truncate long output, keeping head and tail for context."""
+    if len(content) > max_length:
+        half = max_length // 2
+        return content[:half] + f"\n\n... ({len(content) - max_length} characters truncated) ...\n\n" + content[-half:]
+    return content
+
 def filter_error(error):
-    # Filter out errors that we do not want to see
     filtered_lines = []
     i = 0
     error_lines = error.splitlines()
     while i < len(error_lines):
         line = error_lines[i]
 
-        # Skip the next lines if ioctl error, add relevant lines
         if "Inappropriate ioctl for device" in line:
             i += 3
-            if '<<exit>>' in error_lines[i]:
+            if i < len(error_lines) and '<<exit>>' in error_lines[i]:
                 i += 1
             while i < len(error_lines) - 1:
                 filtered_lines.append(error_lines[i])
@@ -128,38 +140,75 @@ def filter_error(error):
         i += 1
     return '\n'.join(filtered_lines).strip()
 
-async def tool_function_call(command):
-    """Execute a command in the bash shell."""
-    try:
-        bash_session = BashSession()
 
-        if not bash_session._started:
-            await bash_session.start()
+class _PersistentLoop:
+    """Manages a persistent asyncio event loop in a background thread for session reuse."""
 
-        output, error = await bash_session.run(command)
+    def __init__(self):
+        self._loop = None
+        self._thread = None
+        self._session = None
+        self._lock = threading.Lock()
+
+    def _ensure_loop(self):
+        if self._loop is None or not self._loop.is_running():
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+            self._thread.start()
+
+    def _run_coro(self, coro):
+        """Submit a coroutine to the persistent loop and wait for the result."""
+        self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    async def _execute(self, command):
+        """Execute a command, creating or reusing the session as needed."""
+        if self._session is None or self._session._timed_out or (
+            self._session._process is not None and self._session._process.returncode is not None
+        ):
+            if self._session is not None:
+                self._session.stop()
+            self._session = BashSession()
+
+        if not self._session._started:
+            await self._session.start()
+
+        output, error = await self._session.run(command)
         error = filter_error(error)
         result = ""
         if output:
             result += output
         if error:
             result += "\nError:\n" + error
-        return result.strip()
-    except Exception as e:
-        return f"Error: {str(e)}"
+        return maybe_truncate(result.strip())
+
+    def run(self, command):
+        with self._lock:
+            try:
+                return self._run_coro(self._execute(command))
+            except Exception as e:
+                # Reset session on failure
+                if self._session is not None:
+                    try:
+                        self._session.stop()
+                    except Exception:
+                        pass
+                    self._session = None
+                return f"Error: {str(e)}"
+
+
+_persistent_loop = _PersistentLoop()
+
 
 def tool_function(command):
-    return asyncio.run(tool_function_call(command))
+    return _persistent_loop.run(command)
+
 
 if __name__ == "__main__":
-    # Example usage
-    import sys
-
-    # Check if the script is called with arguments
     if len(sys.argv) < 2:
         print("Usage: python bash.py '<command>'")
     else:
-        # Extract the command from the command-line arguments
         input_command = ' '.join(sys.argv[1:])
-        # Run the tool_function asynchronously
         result = tool_function(input_command)
         print(result)

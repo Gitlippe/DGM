@@ -4,8 +4,13 @@ import json
 import math
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, TimeoutError
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
+import time
+
+from config import CONVERGENCE_WINDOW, CONVERGENCE_THRESHOLD, MIN_ARCHIVE_SCORE, RANDOM_SEED
+from llm import get_llm_metrics, reset_llm_metrics
 from prompts.self_improvement_prompt import find_selfimprove_eval_logs
 from self_improve_step import self_improve
 from utils.common_utils import load_json_file
@@ -28,7 +33,7 @@ def initialize_run(output_dir, prevrun_dir=None, polyglot=False):
     initial_folder_name = 'initial' if not polyglot else 'initial_polyglot'
     if not prevrun_dir and not os.path.exists(f"{output_dir}/{initial_folder_name}"):
         if os.path.exists(initial_folder_name):
-            os.system(f"cp -r {initial_folder_name}/ {output_dir}/initial")
+            shutil.copytree(initial_folder_name, f"{output_dir}/initial")
         else:
             raise RuntimeError("Error: Need to properly configure evaluation results for the initial version.")
     
@@ -99,8 +104,8 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
         probabilities = [prob / sum(probabilities) for prob in probabilities]
         parent_commits = random.choices(commits, probabilities, k=selfimprove_size)
     elif method == 'best':
-        # Choose parents with the best score
-        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'])
+        # Choose parents with the best score (descending sort)
+        sorted_commits = sorted(candidates, key=lambda x: candidates[x]['accuracy_score'], reverse=True)
         parent_commits = sorted_commits[:min(selfimprove_size, len(sorted_commits))]
         if len(parent_commits) < selfimprove_size:
             parent_commits.extend(random.choices(parent_commits, k=selfimprove_size - len(parent_commits)))
@@ -141,7 +146,7 @@ def choose_selfimproves(output_dir, archive, selfimprove_size, method='random', 
                 continue
 
             # Choose a random unresolved entry
-            if unresolved_ids == 0:
+            if len(unresolved_ids) == 0:
                 continue
             entry_ids = unresolved_ids
         entry = random.choice(entry_ids)
@@ -213,8 +218,7 @@ def get_full_eval_threshold(output_dir, archive):
 
     # Get threshold, second highest score
     threshold = sorted(archive_scores, reverse=True)[1] if len(archive_scores) > 1 else archive_scores[0]
-    # Ensure threshold is at least 0.4
-    threshold = max(threshold, 0.4)
+    threshold = max(threshold, MIN_ARCHIVE_SCORE)
 
     return threshold
 
@@ -225,7 +229,7 @@ def main():
     parser.add_argument("--selfimprove_workers", type=int, default=2, help="Number of parallel workers for self-improvement attempts.")
     parser.add_argument(
         "--choose_selfimproves_method", type=str, default='score_child_prop',
-        choices=['random', 'score_prop', 'score_child_prop' 'best'],
+        choices=['random', 'score_prop', 'score_child_prop', 'best'],
         help="Method to choose self-improve attempts.",
     )
     parser.add_argument("--continue_from", type=str, default=None, help="Directory to continue the run from.")
@@ -239,7 +243,15 @@ def main():
     parser.add_argument("--no_full_eval", default=False, action='store_true', help="Do not run full evaluation on swe if a node is the top N highest performing.")
     # baselines
     parser.add_argument("--run_baseline", type=str, default=None, choices=['no_selfimprove', 'no_darwin'], help="Baseline to run.")
+    parser.add_argument("--random_seed", type=int, default=None, help="Random seed for reproducibility.")
+    parser.add_argument("--convergence_window", type=int, default=CONVERGENCE_WINDOW, help="Number of generations to look back for convergence detection.")
+    parser.add_argument("--convergence_threshold", type=float, default=CONVERGENCE_THRESHOLD, help="Min improvement over convergence window to continue.")
     args = parser.parse_args()
+
+    # Set random seed for reproducibility if configured
+    seed = RANDOM_SEED if RANDOM_SEED is not None else args.random_seed
+    if seed is not None:
+        random.seed(seed)
 
     # Variables for this DGM run
     if not args.continue_from:
@@ -268,6 +280,9 @@ def main():
     test_more_threshold = 0.4
     # Run the DGM
     for gen_num in range(start_gen_num, args.max_generation):
+        gen_start_time = time.time()
+        reset_llm_metrics()
+
         # Choose self-improve attempts
         selfimprove_entries = choose_selfimproves(
             output_dir, archive, args.selfimprove_size,
@@ -321,6 +336,17 @@ def main():
         )
         archive = update_archive(output_dir, archive, selfimprove_ids_compiled, method=args.update_archive, noise_leeway=args.eval_noise)
 
+        # Gather generation-level metrics
+        gen_duration = time.time() - gen_start_time
+        llm_metrics = get_llm_metrics()
+        archive_scores = []
+        for aid in archive:
+            try:
+                meta = load_json_file(os.path.join(output_dir, aid, "metadata.json"))
+                archive_scores.append(meta["overall_performance"]["accuracy_score"])
+            except Exception:
+                pass
+
         # Save DGM state
         with open(os.path.join(output_dir, "dgm_metadata.jsonl"), "a") as f:
             f.write(json.dumps({
@@ -329,7 +355,42 @@ def main():
                 "children": selfimprove_ids,
                 "children_compiled": selfimprove_ids_compiled,
                 "archive": archive,
+                "metrics": {
+                    "generation_duration_seconds": round(gen_duration, 1),
+                    "archive_size": len(archive),
+                    "archive_best_score": max(archive_scores) if archive_scores else None,
+                    "archive_mean_score": round(sum(archive_scores) / len(archive_scores), 4) if archive_scores else None,
+                    "compile_rate": round(len(selfimprove_ids_compiled) / max(len(selfimprove_ids), 1), 4),
+                    "llm_calls": llm_metrics["total_calls"],
+                    "llm_total_tokens": llm_metrics["total_input_tokens"] + llm_metrics["total_output_tokens"],
+                    "llm_latency_seconds": round(llm_metrics["total_latency_seconds"], 1),
+                },
             }, indent=2) + "\n")
+
+        logger.info(f"Generation {gen_num} completed in {gen_duration:.1f}s | "
+                     f"archive_size={len(archive)} best={max(archive_scores) if archive_scores else 'N/A'} "
+                     f"compiled={len(selfimprove_ids_compiled)}/{len(selfimprove_ids)} "
+                     f"llm_calls={llm_metrics['total_calls']}")
+
+        # Convergence detection: check if the best score hasn't improved over the window
+        if (gen_num - start_gen_num) >= args.convergence_window:
+            try:
+                metadata_path = os.path.join(output_dir, "dgm_metadata.jsonl")
+                all_meta = load_dgm_metadata(metadata_path)
+                recent = all_meta[-args.convergence_window:]
+                recent_bests = [m.get("metrics", {}).get("archive_best_score") for m in recent
+                                if m.get("metrics", {}).get("archive_best_score") is not None]
+                if len(recent_bests) >= args.convergence_window:
+                    improvement = max(recent_bests) - min(recent_bests)
+                    if improvement < args.convergence_threshold:
+                        logger.info(
+                            f"Convergence detected: best score improved by only {improvement:.4f} "
+                            f"over the last {args.convergence_window} generations (threshold={args.convergence_threshold}). "
+                            f"Stopping evolution."
+                        )
+                        break
+            except Exception as e:
+                logger.warning(f"Convergence check failed: {e}")
 
 if __name__ == "__main__":
     main()

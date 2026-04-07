@@ -2,12 +2,55 @@
 import json
 import os
 import re
+import threading
+import time
 
 import anthropic
 import backoff
 import openai
 
-MAX_OUTPUT_TOKENS = 4096
+from config import MAX_OUTPUT_TOKENS
+
+# Thread-safe LLM call metrics tracking
+_metrics_lock = threading.Lock()
+_llm_metrics = {
+    "total_calls": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "total_latency_seconds": 0.0,
+    "calls_by_model": {},
+    "errors": 0,
+}
+
+def get_llm_metrics():
+    """Return a snapshot of accumulated LLM call metrics."""
+    with _metrics_lock:
+        return dict(_llm_metrics)
+
+def reset_llm_metrics():
+    """Reset all LLM metrics counters."""
+    with _metrics_lock:
+        _llm_metrics["total_calls"] = 0
+        _llm_metrics["total_input_tokens"] = 0
+        _llm_metrics["total_output_tokens"] = 0
+        _llm_metrics["total_latency_seconds"] = 0.0
+        _llm_metrics["calls_by_model"] = {}
+        _llm_metrics["errors"] = 0
+
+def _record_llm_call(model, input_tokens=0, output_tokens=0, latency=0.0, error=False):
+    """Record metrics from a single LLM call."""
+    with _metrics_lock:
+        _llm_metrics["total_calls"] += 1
+        _llm_metrics["total_input_tokens"] += input_tokens
+        _llm_metrics["total_output_tokens"] += output_tokens
+        _llm_metrics["total_latency_seconds"] += latency
+        if error:
+            _llm_metrics["errors"] += 1
+        if model not in _llm_metrics["calls_by_model"]:
+            _llm_metrics["calls_by_model"][model] = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+        _llm_metrics["calls_by_model"][model]["calls"] += 1
+        _llm_metrics["calls_by_model"][model]["input_tokens"] += input_tokens
+        _llm_metrics["calls_by_model"][model]["output_tokens"] += output_tokens
 AVAILABLE_LLMS = [
     # Anthropic models
     "claude-3-5-sonnet-20240620",
@@ -80,7 +123,8 @@ def create_client(model: str):
         client = openai.OpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
             base_url="https://openrouter.ai/api/v1"
-        ), model
+        )
+        return client, model
     else:
         raise ValueError(f"Model {model} not supported.")
 
@@ -181,6 +225,10 @@ def get_response_from_llm(
     if msg_history is None:
         msg_history = []
 
+    t0 = time.time()
+    input_tokens = 0
+    output_tokens = 0
+
     if "claude" in model:
         new_msg_history = msg_history + [
             {
@@ -201,6 +249,9 @@ def get_response_from_llm(
             messages=new_msg_history,
         )
         content = response.content[0].text
+        if hasattr(response, 'usage'):
+            input_tokens = getattr(response.usage, 'input_tokens', 0)
+            output_tokens = getattr(response.usage, 'output_tokens', 0)
         new_msg_history = new_msg_history + [
             {
                 "role": "assistant",
@@ -293,6 +344,10 @@ def get_response_from_llm(
         resoning_content = response.choices[0].message.reasoning_content
     else:
         raise ValueError(f"Model {model} not supported.")
+
+    latency = time.time() - t0
+    _record_llm_call(model, input_tokens=input_tokens, output_tokens=output_tokens, latency=latency)
+
     if print_debug:
         print()
         print("*" * 20 + " LLM START " + "*" * 20)
