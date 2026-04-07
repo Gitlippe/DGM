@@ -82,13 +82,11 @@ def check_for_tool_use(response, model=''):
 
     elif model.startswith('o3-'):
         # OpenAI, check for tool_calls in response
-        tool_call = None
-        for item in response.output:
-            if item.type == "function_call":
-                tool_call = item
-                break
-
-        if tool_call:
+        tool_call = next(
+            (output_item for output_item in response.output if output_item.type == "function_call"),
+            None,
+        )
+        if tool_call is not None:
             return {
                 'tool_id': tool_call.call_id,
                 'tool_name': tool_call.name,

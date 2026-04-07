@@ -97,7 +97,7 @@ def _log_if(logger, msg):
     if logger is not None:
         logger.info(msg)
 
-def is_compiled_self_improve(metadata, num_swe_issues=[], logger=None):
+def is_compiled_self_improve(metadata, num_swe_issues=None, logger=None):
     """
     Checks if the run was properly compiled and 'self-improved' by verifying:
       1. The 'overall_performance' dict has the required keys:
@@ -108,7 +108,13 @@ def is_compiled_self_improve(metadata, num_swe_issues=[], logger=None):
     Returns True if all conditions are met, else False.
     """
     overall_perf = metadata.get('overall_performance', {})
-    required_keys = ['accuracy_score', 'total_unresolved_ids', 'total_resolved_ids', 'total_emptypatch_ids']
+    required_keys = [
+        'accuracy_score',
+        'total_unresolved_ids',
+        'total_resolved_ids',
+        'total_emptypatch_ids',
+        'total_submitted_instances',
+    ]
 
     if not overall_perf or not all(k in overall_perf for k in required_keys):
         _log_if(logger, "no required keys")
@@ -122,7 +128,8 @@ def is_compiled_self_improve(metadata, num_swe_issues=[], logger=None):
 
     if num_swe_issues:
         total_evaluated = overall_perf['total_submitted_instances']
-        if total_evaluated < num_swe_issues[0]:
+        min_expected_issues = min(num_swe_issues)
+        if total_evaluated < min_expected_issues:
             _log_if(logger, "not match num_issues")
             return False
 
