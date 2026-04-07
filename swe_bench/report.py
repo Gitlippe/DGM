@@ -81,17 +81,29 @@ def preds_to_jsonl(dname, predictions):
     return predictions_jsonl
 
 def run_evals(predictions_jsonl, run_id, dataset_name, root_dir, output_dir, num_eval_procs=5):
-    os.chdir(output_dir)  # switch dir so that things will be saved in the specified output_dir
-    run_evals_cmd = f"""
-python {os.path.join(root_dir, './swe_bench/SWE-bench/swebench/harness/run_evaluation.py')}
-    --dataset_name {dataset_name}
-    --predictions_path {predictions_jsonl}
-    --max_workers {num_eval_procs}
-    --run_id {run_id}
-"""
-    run_evals_cmd = " ".join([line.strip() for line in run_evals_cmd.split() if line.strip()])
-    subprocess.run(run_evals_cmd.split(), check=True)
-    os.chdir(root_dir)  # switch back to the original directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_evals_cmd = [
+        "python",
+        os.path.join(root_dir, './swe_bench/SWE-bench/swebench/harness/run_evaluation.py'),
+        "--dataset_name",
+        dataset_name,
+        "--predictions_path",
+        predictions_jsonl,
+        "--max_workers",
+        str(num_eval_procs),
+        "--run_id",
+        run_id,
+    ]
+    eval_log_path = output_dir / f"{run_id}_run_evaluation.log"
+    with open(eval_log_path, "w") as eval_log:
+        subprocess.run(
+            run_evals_cmd,
+            check=True,
+            cwd=output_dir,
+            stdout=eval_log,
+            stderr=subprocess.STDOUT,
+        )
 
 def make_report(
         dnames,

@@ -80,11 +80,11 @@ def check_for_tool_use(response, model=''):
 
     elif model.startswith('o3-'):
         # OpenAI, check for tool_calls in response
-        for tool_call in response.output:
-            if tool_call.type == "function_call":
-                break
-
-        if tool_call:
+        tool_call = next(
+            (output_item for output_item in response.output if output_item.type == "function_call"),
+            None,
+        )
+        if tool_call is not None:
             return {
                 'tool_id': tool_call.call_id,
                 'tool_name': tool_call.name,
@@ -330,8 +330,8 @@ def chat_with_agent_manualtools(msg, model, msg_history=None, logging=print):
             # Check for next tool use
             tool_use = check_for_tool_use(response, model=client_model)
 
-    except Exception:
-        pass
+    except Exception as e:
+        logging(f"Error in chat_with_agent_manualtools: {e}")
 
     return new_msg_history
 
@@ -419,8 +419,8 @@ def chat_with_agent_claude(
             ],
         })
 
-    except Exception:
-        pass
+    except Exception as e:
+        logging(f"Error in chat_with_agent_claude: {e}")
 
     return new_msg_history
 
@@ -506,8 +506,8 @@ def chat_with_agent_openai(
         # Get final response
         new_msg_history.append(response)
 
-    except Exception:
-        pass
+    except Exception as e:
+        logging(f"Error in chat_with_agent_openai: {e}")
 
     return new_msg_history
 
